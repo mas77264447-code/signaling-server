@@ -5,8 +5,7 @@ const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// الأجهزة المتصلة الآن: deviceKey -> { ws, user }
-// deviceKey = اسم المستخدم + "/" + معرّف الجهاز
+// الأجهزة المتصلة الآن: "اسم_المستخدم/معرّف_الجهاز" -> { ws, user, device }
 const online = new Map();
 
 function hashPassword(password, salt) {
@@ -48,25 +47,12 @@ async function checkLogin(username, password) {
   return hashPassword(password, salt) === hash;
 }
 
-async function listGrants(owner) {
-  return db('GET', `grants?owner_id=eq.${encodeURIComponent(owner)}&select=trusted_id,source`);
-}
-
-async function addGrant(owner, trusted, source) {
-  await db('POST', 'grants', { owner_id: owner, trusted_id: trusted, source });
-}
-
-async function removeGrant(owner, trusted, source) {
-  await db('DELETE', `grants?owner_id=eq.${encodeURIComponent(owner)}&trusted_id=eq.${encodeURIComponent(trusted)}&source=eq.${encodeURIComponent(source)}`);
-}
-
-// قائمة الأجهزة المتصلة لحساب معيّن
-function devicesOf(user) {
-  const list = [];
-  for (const [key, entry] of online) {
-    if (entry.user === user) list.push(entry.device);
+// أول جهاز متصل لحساب معيّن (يُستخدم عندما لا يُحدَّد الجهاز)
+function firstDeviceOf(user) {
+  for (const [, entry] of online) {
+    if (entry.user === user && entry.ws.readyState === 1) return entry;
   }
-  return list;
+  return null;
 }
 
 function send(ws, obj) {
@@ -76,8 +62,8 @@ function send(ws, obj) {
 const wss = new WebSocketServer({ port: PORT });
 
 wss.on('connection', (ws) => {
-  let me = null; // { user, device }
   let myKey = null;
+  let me = null; // { user, device }
 
   ws.on('message', async (raw) => {
     let msg;
@@ -106,53 +92,25 @@ wss.on('connection', (ws) => {
           me = { user: username, device };
           myKey = `${username}/${device}`;
           online.set(myKey, { ws, user: username, device });
-          const grants = await listGrants(username);
-          send(ws, {
-            type: 'login_result',
-            ok: true,
-            id: username,
-            device,
-            grants,
-            devices: devicesOf(username).filter((d) => d !== device),
-          });
-          break;
-        }
-
-        case 'list_devices': {
-          if (!me) break;
-          // أجهزة الحساب الآخر المتصلة الآن
-          const other = String(msg.user);
-          const list = [];
-          for (const [, entry] of online) {
-            if (entry.user === other) list.push(entry.device);
-          }
-          send(ws, { type: 'devices', user: other, devices: list });
-          break;
-        }
-
-        case 'grant': {
-          if (!me) break;
-          await addGrant(me.user, String(msg.trusted), String(msg.source));
-          send(ws, { type: 'grants', grants: await listGrants(me.user) });
-          break;
-        }
-
-        case 'revoke': {
-          if (!me) break;
-          await removeGrant(me.user, String(msg.trusted), String(msg.source));
-          send(ws, { type: 'grants', grants: await listGrants(me.user) });
+          send(ws, { type: 'login_result', ok: true, id: username, device });
           break;
         }
 
         case 'signal': {
           if (!me) break;
-          // الهدف: اسم المستخدم + معرّف الجهاز
-          const targetKey = `${String(msg.toUser)}/${String(msg.toDevice)}`;
-          const target = online.get(targetKey);
+          const toUser = String(msg.toUser);
+          const toDevice = msg.toDevice ? String(msg.toDevice) : '';
+
+          // إن لم يُحدَّد الجهاز، نختار أول جهاز متصل للحساب الهدف
+          const target = toDevice
+            ? online.get(`${toUser}/${toDevice}`)
+            : firstDeviceOf(toUser);
+
           if (!target || target.ws.readyState !== 1) {
-            send(ws, { type: 'error', message: 'الجهاز غير متصل' });
+            send(ws, { type: 'error', message: 'لا يوجد جهاز متصل لهذا الحساب' });
             break;
           }
+
           target.ws.send(JSON.stringify({
             type: 'signal',
             from: me.user,
